@@ -1,0 +1,1427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QR Dude</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 24px;
+      color: #111;
+      background: #fff;
+    }
+    #wrap {
+      max-width: 520px;
+    }
+    #qrImage {
+      display: block;
+      margin: 0 0 16px 0;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      border: 1px solid #ccc;
+      max-width: 100%;
+      height: auto;
+    }
+    #linkInput {
+      width: 100%;
+      box-sizing: border-box;
+      font-size: 16px;
+      padding: 10px 12px;
+    }
+    #status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #666;
+      min-height: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <img id="qrImage" alt="QR code" />
+    <input id="linkInput" type="text" placeholder="Enter http or https URL" />
+    <div id="status"></div>
+  </div>
+
+  <script>
+    "use strict";
+
+    // =========================================================================
+    // Public API
+    // =========================================================================
+
+    const QrErrorCorrectionLevel = Object.freeze({
+      Low: 0,
+      Medium: 1,
+      Quartile: 2,
+      High: 3
+    });
+
+    class Rgb24 {
+      constructor(r, g, b) {
+        this.r = r & 0xFF;
+        this.g = g & 0xFF;
+        this.b = b & 0xFF;
+      }
+
+      static get Black() {
+        return new Rgb24(0, 0, 0);
+      }
+
+      static get White() {
+        return new Rgb24(255, 255, 255);
+      }
+
+      toString() {
+        return "#" +
+          this.r.toString(16).padStart(2, "0").toUpperCase() +
+          this.g.toString(16).padStart(2, "0").toUpperCase() +
+          this.b.toString(16).padStart(2, "0").toUpperCase();
+      }
+    }
+
+    class QrRenderOptions {
+      constructor() {
+        this.scale = 10;
+        this.border = 4;
+        this.darkColor = Rgb24.Black;
+        this.lightColor = Rgb24.White;
+      }
+    }
+
+    class QrCreateOptions {
+      constructor() {
+        this.errorCorrectionLevel = QrErrorCorrectionLevel.Medium;
+        this.minVersion = 1;
+        this.maxVersion = 40;
+        this.mask = null;
+        this.boostErrorCorrection = false;
+        this.optimizeTextMode = true;
+        this.render = new QrRenderOptions();
+      }
+    }
+
+    class QrBitmapResult {
+      constructor() {
+        this.input = "";
+        this.version = 0;
+        this.size = 0;
+        this.mask = 0;
+        this.errorCorrectionLevel = QrErrorCorrectionLevel.Medium;
+        this.modules = [];
+        this.bmpBytes = new Uint8Array(0);
+      }
+    }
+
+    class QrBitmapGenerator {
+      static createUrlBmp(url) {
+        return QrBitmapGenerator.createUrl(url, null).bmpBytes;
+      }
+
+      static createUrlBmpWithOptions(url, options) {
+        return QrBitmapGenerator.createUrl(url, options).bmpBytes;
+      }
+
+      static createBmp(text) {
+        return QrBitmapGenerator.create(text, null).bmpBytes;
+      }
+
+      static createBmpWithOptions(text, options) {
+        return QrBitmapGenerator.create(text, options).bmpBytes;
+      }
+
+      static tryCreateUrlBmp(url) {
+        try {
+          return { ok: true, bmpBytes: QrBitmapGenerator.createUrlBmp(url) };
+        } catch {
+          return { ok: false, bmpBytes: new Uint8Array(0) };
+        }
+      }
+
+      static tryCreateUrlBmpWithOptions(url, options) {
+        try {
+          return { ok: true, bmpBytes: QrBitmapGenerator.createUrlBmpWithOptions(url, options) };
+        } catch {
+          return { ok: false, bmpBytes: new Uint8Array(0) };
+        }
+      }
+
+      static tryCreateBmp(text) {
+        try {
+          return { ok: true, bmpBytes: QrBitmapGenerator.createBmp(text) };
+        } catch {
+          return { ok: false, bmpBytes: new Uint8Array(0) };
+        }
+      }
+
+      static tryCreateBmpWithOptions(text, options) {
+        try {
+          return { ok: true, bmpBytes: QrBitmapGenerator.createBmpWithOptions(text, options) };
+        } catch {
+          return { ok: false, bmpBytes: new Uint8Array(0) };
+        }
+      }
+
+      static createUrl(url, options = null) {
+        Guard.notNullOrWhiteSpace(url, "url");
+        Guard.httpOrHttpsUrl(url, "url");
+
+        options ??= new QrCreateOptions();
+
+        return QrBitmapGenerator.createInternal(url, options, true);
+      }
+
+      static create(text, options = null) {
+        Guard.notNullOrWhiteSpace(text, "text");
+
+        options ??= new QrCreateOptions();
+
+        return QrBitmapGenerator.createInternal(text, options, false);
+      }
+
+      static createInternal(input, options, isUrl) {
+        Guard.versionRange(options.minVersion, "minVersion");
+        Guard.versionRange(options.maxVersion, "maxVersion");
+
+        if (options.minVersion > options.maxVersion)
+          throw new Error("MinVersion must be <= MaxVersion.");
+
+        if (options.mask != null && (options.mask < 0 || options.mask > 7))
+          throw new RangeError("Mask must be 0 through 7.");
+
+        Guard.positive(options.render.scale, "scale");
+        if (options.render.border < 0)
+          throw new RangeError("Border must be >= 0.");
+
+        let segment;
+        if (options.optimizeTextMode) {
+          segment = QrSegment.makeBest(input);
+        } else {
+          segment = QrSegment.makeBytes(new TextEncoder().encode(input));
+        }
+
+        const segments = [segment];
+
+        const qr = QrCode.encodeSegments(
+          segments,
+          options.errorCorrectionLevel,
+          options.minVersion,
+          options.maxVersion,
+          options.mask,
+          options.boostErrorCorrection
+        );
+
+        const modules = qr.getModulesCopy();
+
+        const bmp = BmpWriter.write24BitBmp(
+          modules,
+          qr.size,
+          options.render.scale,
+          options.render.border,
+          options.render.darkColor,
+          options.render.lightColor
+        );
+
+        const result = new QrBitmapResult();
+        result.input = input;
+        result.version = qr.version;
+        result.size = qr.size;
+        result.mask = qr.mask;
+        result.errorCorrectionLevel = qr.errorCorrectionLevel;
+        result.modules = modules;
+        result.bmpBytes = bmp;
+        return result;
+      }
+    }
+
+    // =========================================================================
+    // Internal mode model
+    // =========================================================================
+
+    const QrMode = Object.freeze({
+      Numeric: 0x1,
+      Alphanumeric: 0x2,
+      Byte: 0x4
+    });
+
+    function modeBits(mode) {
+      return mode;
+    }
+
+    function charCountBits(mode, version) {
+      Guard.versionRange(version, "version");
+
+      if (version <= 9) {
+        switch (mode) {
+          case QrMode.Numeric: return 10;
+          case QrMode.Alphanumeric: return 9;
+          case QrMode.Byte: return 8;
+          default: throw new Error("Unsupported mode.");
+        }
+      }
+
+      if (version <= 26) {
+        switch (mode) {
+          case QrMode.Numeric: return 12;
+          case QrMode.Alphanumeric: return 11;
+          case QrMode.Byte: return 16;
+          default: throw new Error("Unsupported mode.");
+        }
+      }
+
+      switch (mode) {
+        case QrMode.Numeric: return 14;
+        case QrMode.Alphanumeric: return 13;
+        case QrMode.Byte: return 16;
+        default: throw new Error("Unsupported mode.");
+      }
+    }
+
+    // =========================================================================
+    // Segment
+    // =========================================================================
+
+    class QrSegment {
+      static ALPHANUMERIC_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+      static ALPHANUMERIC_MAP = QrSegment.buildAlphanumericMap();
+
+      constructor(mode, numChars, data, bitLength) {
+        this.mode = mode;
+        this.numChars = numChars;
+        this.data = data;
+        this.bitLength = bitLength;
+      }
+
+      static makeBest(text) {
+        Guard.notNull(text, "text");
+
+        if (text.length === 0)
+          return QrSegment.makeBytes(new Uint8Array(0));
+
+        if (QrSegment.isNumeric(text))
+          return QrSegment.makeNumeric(text);
+
+        if (QrSegment.isAlphanumeric(text))
+          return QrSegment.makeAlphanumeric(text);
+
+        return QrSegment.makeBytes(new TextEncoder().encode(text));
+      }
+
+      static makeBytes(data) {
+        Guard.notNull(data, "data");
+        const copy = new Uint8Array(data.length);
+        copy.set(data);
+        return new QrSegment(QrMode.Byte, copy.length, copy, copy.length * 8);
+      }
+
+      static makeNumeric(digits) {
+        Guard.notNull(digits, "digits");
+
+        if (!QrSegment.isNumeric(digits))
+          throw new Error("Input contains non-numeric characters.");
+
+        const bb = new BitBuffer();
+
+        for (let i = 0; i < digits.length;) {
+          const n = Math.min(3, digits.length - i);
+          const val = parseInt(digits.slice(i, i + n), 10);
+          if (n === 3)
+            bb.appendBits(val, 10);
+          else if (n === 2)
+            bb.appendBits(val, 7);
+          else
+            bb.appendBits(val, 4);
+
+          i += n;
+        }
+
+        return new QrSegment(QrMode.Numeric, digits.length, bb.toByteArray(), bb.bitLength);
+      }
+
+      static makeAlphanumeric(text) {
+        Guard.notNull(text, "text");
+
+        if (!QrSegment.isAlphanumeric(text))
+          throw new Error("Input contains characters not supported by QR alphanumeric mode.");
+
+        const bb = new BitBuffer();
+
+        let i = 0;
+        while (i + 1 < text.length) {
+          const a = QrSegment.alphanumericValue(text[i]);
+          const b = QrSegment.alphanumericValue(text[i + 1]);
+          const value = a * 45 + b;
+          bb.appendBits(value, 11);
+          i += 2;
+        }
+
+        if (i < text.length) {
+          const value = QrSegment.alphanumericValue(text[i]);
+          bb.appendBits(value, 6);
+        }
+
+        return new QrSegment(QrMode.Alphanumeric, text.length, bb.toByteArray(), bb.bitLength);
+      }
+
+      appendTo(bb) {
+        Guard.notNull(bb, "bb");
+
+        for (let i = 0; i < this.bitLength; i++) {
+          const bit = BitHelper.getBitFromBytes(this.data, i);
+          bb.appendBit(bit);
+        }
+      }
+
+      static getTotalBits(segments, version) {
+        Guard.notNull(segments, "segments");
+        Guard.versionRange(version, "version");
+
+        let total = 0;
+
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i];
+          const ccbits = charCountBits(seg.mode, version);
+
+          if (seg.numChars >= (1 << ccbits))
+            return -1;
+
+          total += 4 + ccbits + seg.bitLength;
+
+          if (total > 0x7FFFFFFF)
+            return -1;
+        }
+
+        return total;
+      }
+
+      static isNumeric(text) {
+        for (let i = 0; i < text.length; i++) {
+          const c = text.charCodeAt(i);
+          if (c < 48 || c > 57)
+            return false;
+        }
+        return true;
+      }
+
+      static isAlphanumeric(text) {
+        for (let i = 0; i < text.length; i++) {
+          const c = text.charCodeAt(i);
+          if (c >= QrSegment.ALPHANUMERIC_MAP.length || QrSegment.ALPHANUMERIC_MAP[c] < 0)
+            return false;
+        }
+        return true;
+      }
+
+      static alphanumericValue(c) {
+        const code = c.charCodeAt(0);
+        if (code >= QrSegment.ALPHANUMERIC_MAP.length)
+          throw new RangeError("Character out of range.");
+
+        const value = QrSegment.ALPHANUMERIC_MAP[code];
+        if (value < 0)
+          throw new Error("Character '" + c + "' is not in the QR alphanumeric set.");
+
+        return value;
+      }
+
+      static buildAlphanumericMap() {
+        const map = new Int32Array(128);
+        for (let i = 0; i < map.length; i++)
+          map[i] = -1;
+
+        for (let i = 0; i < QrSegment.ALPHANUMERIC_CHARSET.length; i++)
+          map[QrSegment.ALPHANUMERIC_CHARSET.charCodeAt(i)] = i;
+
+        return map;
+      }
+    }
+
+    // =========================================================================
+    // Bit buffer
+    // =========================================================================
+
+    class BitBuffer {
+      constructor() {
+        this._bytes = [];
+        this._bitLength = 0;
+      }
+
+      get bitLength() {
+        return this._bitLength;
+      }
+
+      appendBit(value) {
+        const byteIndex = this._bitLength >> 3;
+        const bitInByte = 7 - (this._bitLength & 7);
+
+        if (byteIndex === this._bytes.length)
+          this._bytes.push(0);
+
+        if (value)
+          this._bytes[byteIndex] |= (1 << bitInByte);
+
+        this._bitLength++;
+      }
+
+      appendBits(value, bitCount) {
+        if (bitCount < 0 || bitCount > 31)
+          throw new RangeError("bitCount");
+
+        if (bitCount < 31 && (value >>> bitCount) !== 0)
+          throw new Error("Value contains bits outside the requested width.");
+
+        for (let i = bitCount - 1; i >= 0; i--)
+          this.appendBit(((value >>> i) & 1) !== 0);
+      }
+
+      appendByte(value) {
+        this.appendBits(value & 0xFF, 8);
+      }
+
+      appendBytes(data) {
+        Guard.notNull(data, "data");
+
+        for (let i = 0; i < data.length; i++)
+          this.appendByte(data[i]);
+      }
+
+      toByteArray() {
+        return Uint8Array.from(this._bytes);
+      }
+    }
+
+    // =========================================================================
+    // QR core
+    // =========================================================================
+
+    class QrCode {
+      constructor(version, ecl, dataCodewords, requestedMask) {
+        this.version = version;
+        this.errorCorrectionLevel = ecl;
+        this._size = version * 4 + 17;
+        this._modules = createBoolMatrix(this._size, this._size, false);
+        this._isFunction = createBoolMatrix(this._size, this._size, false);
+        this.mask = 0;
+
+        this.drawFunctionPatterns();
+
+        const allCodewords = this.addErrorCorrectionAndInterleave(dataCodewords);
+        this.drawCodewords(allCodewords);
+
+        if (requestedMask != null) {
+          this.applyMask(requestedMask);
+          this.drawFormatBits(requestedMask);
+          this.mask = requestedMask;
+        } else {
+          let bestMask = 0;
+          let bestPenalty = 0x7FFFFFFF;
+
+          for (let mask = 0; mask < 8; mask++) {
+            this.applyMask(mask);
+            this.drawFormatBits(mask);
+
+            const penalty = this.getPenaltyScore();
+
+            if (penalty < bestPenalty) {
+              bestPenalty = penalty;
+              bestMask = mask;
+            }
+
+            this.applyMask(mask);
+          }
+
+          this.applyMask(bestMask);
+          this.drawFormatBits(bestMask);
+          this.mask = bestMask;
+        }
+      }
+
+      get size() {
+        return this._size;
+      }
+
+      static encodeSegments(segments, ecl, minVersion, maxVersion, mask, boostEcl) {
+        Guard.notNull(segments, "segments");
+        Guard.versionRange(minVersion, "minVersion");
+        Guard.versionRange(maxVersion, "maxVersion");
+
+        if (minVersion > maxVersion)
+          throw new Error("minVersion must be <= maxVersion.");
+
+        if (mask != null && (mask < 0 || mask > 7))
+          throw new RangeError("Mask must be between 0 and 7.");
+
+        let version = -1;
+        let usedBits = -1;
+
+        for (let ver = minVersion; ver <= maxVersion; ver++) {
+          const bits = QrSegment.getTotalBits(segments, ver);
+          if (bits < 0)
+            continue;
+
+          const capacityBits = QrTables.getNumDataCodewords(ver, ecl) * 8;
+          if (bits <= capacityBits) {
+            version = ver;
+            usedBits = bits;
+            break;
+          }
+        }
+
+        if (version === -1)
+          throw new Error("Data does not fit in any allowed QR version.");
+
+        if (boostEcl) {
+          for (const candidate of QrCode.getBoostCandidates(ecl)) {
+            const capacityBits = QrTables.getNumDataCodewords(version, candidate) * 8;
+            if (usedBits <= capacityBits)
+              ecl = candidate;
+          }
+        }
+
+        const dataCapacityBits = QrTables.getNumDataCodewords(version, ecl) * 8;
+        const bb = new BitBuffer();
+
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i];
+          bb.appendBits(modeBits(seg.mode), 4);
+          bb.appendBits(seg.numChars, charCountBits(seg.mode, version));
+          seg.appendTo(bb);
+        }
+
+        const terminatorBits = Math.min(4, dataCapacityBits - bb.bitLength);
+        bb.appendBits(0, terminatorBits);
+
+        const alignBits = (8 - (bb.bitLength & 7)) & 7;
+        bb.appendBits(0, alignBits);
+
+        let padByte = 0xEC;
+        while (bb.bitLength < dataCapacityBits) {
+          bb.appendBits(padByte, 8);
+          padByte = padByte === 0xEC ? 0x11 : 0xEC;
+        }
+
+        const dataCodewords = bb.toByteArray();
+
+        if (dataCodewords.length !== QrTables.getNumDataCodewords(version, ecl))
+          throw new Error("Internal error: data codeword count mismatch.");
+
+        return new QrCode(version, ecl, dataCodewords, mask);
+      }
+
+      getModulesCopy() {
+        const copy = createBoolMatrix(this._size, this._size, false);
+
+        for (let y = 0; y < this._size; y++) {
+          for (let x = 0; x < this._size; x++) {
+            copy[x][y] = this._modules[x][y];
+          }
+        }
+
+        return copy;
+      }
+
+      static *getBoostCandidates(current) {
+        switch (current) {
+          case QrErrorCorrectionLevel.Low:
+            yield QrErrorCorrectionLevel.Medium;
+            yield QrErrorCorrectionLevel.Quartile;
+            yield QrErrorCorrectionLevel.High;
+            break;
+          case QrErrorCorrectionLevel.Medium:
+            yield QrErrorCorrectionLevel.Quartile;
+            yield QrErrorCorrectionLevel.High;
+            break;
+          case QrErrorCorrectionLevel.Quartile:
+            yield QrErrorCorrectionLevel.High;
+            break;
+          case QrErrorCorrectionLevel.High:
+          default:
+            break;
+        }
+      }
+
+      drawFunctionPatterns() {
+        this.drawFinderPattern(3, 3);
+        this.drawFinderPattern(this._size - 4, 3);
+        this.drawFinderPattern(3, this._size - 4);
+
+        for (let i = 0; i < this._size; i++) {
+          this.setFunctionModule(6, i, i % 2 === 0);
+          this.setFunctionModule(i, 6, i % 2 === 0);
+        }
+
+        const align = QrTables.getAlignmentPatternPositions(this.version);
+        const numAlign = align.length;
+
+        for (let i = 0; i < numAlign; i++) {
+          for (let j = 0; j < numAlign; j++) {
+            const isCorner =
+              (i === 0 && j === 0) ||
+              (i === 0 && j === numAlign - 1) ||
+              (i === numAlign - 1 && j === 0);
+
+            if (!isCorner)
+              this.drawAlignmentPattern(align[i], align[j]);
+          }
+        }
+
+        this.setFunctionModule(8, this._size - 8, true);
+
+        if (this.version >= 7)
+          this.drawVersion();
+
+        this.drawFormatBits(0);
+      }
+
+      drawFinderPattern(centerX, centerY) {
+        for (let dy = -4; dy <= 4; dy++) {
+          for (let dx = -4; dx <= 4; dx++) {
+            const x = centerX + dx;
+            const y = centerY + dy;
+
+            if (x < 0 || x >= this._size || y < 0 || y >= this._size)
+              continue;
+
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            const dark = dist !== 2 && dist !== 4;
+            this.setFunctionModule(x, y, dark);
+          }
+        }
+      }
+
+      drawAlignmentPattern(centerX, centerY) {
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const x = centerX + dx;
+            const y = centerY + dy;
+            const dist = Math.max(Math.abs(dx), Math.abs(dy));
+            const dark = dist === 0 || dist === 2;
+            this.setFunctionModule(x, y, dark);
+          }
+        }
+      }
+
+      drawFormatBits(mask) {
+        const data = (QrTables.getFormatBitsForEcl(this.errorCorrectionLevel) << 3) | mask;
+        let rem = data << 10;
+
+        for (let i = 14; i >= 10; i--) {
+          if (((rem >>> i) & 1) !== 0)
+            rem ^= (0x537 << (i - 10));
+        }
+
+        const bits = ((data << 10) | rem) ^ 0x5412;
+
+        for (let i = 0; i <= 5; i++)
+          this.setFunctionModule(8, i, BitHelper.getBitFromInt(bits, i));
+
+        this.setFunctionModule(8, 7, BitHelper.getBitFromInt(bits, 6));
+        this.setFunctionModule(8, 8, BitHelper.getBitFromInt(bits, 7));
+        this.setFunctionModule(7, 8, BitHelper.getBitFromInt(bits, 8));
+
+        for (let i = 9; i < 15; i++)
+          this.setFunctionModule(14 - i, 8, BitHelper.getBitFromInt(bits, i));
+
+        for (let i = 0; i < 8; i++)
+          this.setFunctionModule(this._size - 1 - i, 8, BitHelper.getBitFromInt(bits, i));
+
+        for (let i = 8; i < 15; i++)
+          this.setFunctionModule(8, this._size - 15 + i, BitHelper.getBitFromInt(bits, i));
+
+        this.setFunctionModule(8, this._size - 8, true);
+      }
+
+      drawVersion() {
+        let rem = this.version << 12;
+
+        for (let i = 17; i >= 12; i--) {
+          if (((rem >>> i) & 1) !== 0)
+            rem ^= (0x1F25 << (i - 12));
+        }
+
+        const bits = (this.version << 12) | rem;
+
+        for (let i = 0; i < 18; i++) {
+          const bit = BitHelper.getBitFromInt(bits, i);
+          const a = this._size - 11 + (i % 3);
+          const b = Math.floor(i / 3);
+
+          this.setFunctionModule(a, b, bit);
+          this.setFunctionModule(b, a, bit);
+        }
+      }
+
+      addErrorCorrectionAndInterleave(data) {
+        const numBlocks = QrTables.getNumErrorCorrectionBlocks(this.version, this.errorCorrectionLevel);
+        const eccPerBlock = QrTables.getEccCodewordsPerBlock(this.version, this.errorCorrectionLevel);
+        const rawCodewords = Math.floor(QrTables.getNumRawDataModules(this.version) / 8);
+        const shortBlockLen = Math.floor(rawCodewords / numBlocks);
+        const numShortBlocks = numBlocks - (rawCodewords % numBlocks);
+        const shortDataLen = shortBlockLen - eccPerBlock;
+
+        const divisor = ReedSolomon.getDivisor(eccPerBlock);
+        const blocks = [];
+
+        let dataOffset = 0;
+        for (let i = 0; i < numBlocks; i++) {
+          const dataLen = shortDataLen + (i < numShortBlocks ? 0 : 1);
+
+          const blockData = new Uint8Array(dataLen);
+          blockData.set(data.subarray(dataOffset, dataOffset + dataLen));
+          dataOffset += dataLen;
+
+          const ecc = ReedSolomon.computeRemainder(blockData, divisor);
+          blocks.push({ data: blockData, ecc: ecc });
+        }
+
+        if (dataOffset !== data.length)
+          throw new Error("Internal error: data block split mismatch.");
+
+        const result = [];
+
+        const maxDataLen = shortDataLen + 1;
+        for (let i = 0; i < maxDataLen; i++) {
+          for (let b = 0; b < blocks.length; b++) {
+            if (i < blocks[b].data.length)
+              result.push(blocks[b].data[i]);
+          }
+        }
+
+        for (let i = 0; i < eccPerBlock; i++) {
+          for (let b = 0; b < blocks.length; b++)
+            result.push(blocks[b].ecc[i]);
+        }
+
+        if (result.length !== rawCodewords)
+          throw new Error("Internal error: codeword interleave mismatch.");
+
+        return Uint8Array.from(result);
+      }
+
+      drawCodewords(data) {
+        let bitIndex = 0;
+        let upward = true;
+
+        for (let right = this._size - 1; right >= 1; right -= 2) {
+          if (right === 6)
+            right--;
+
+          for (let row = 0; row < this._size; row++) {
+            const y = upward ? this._size - 1 - row : row;
+
+            for (let col = 0; col < 2; col++) {
+              const x = right - col;
+              if (this._isFunction[x][y])
+                continue;
+
+              let dark = false;
+              if (bitIndex < data.length * 8)
+                dark = BitHelper.getBitFromBytes(data, bitIndex);
+
+              this._modules[x][y] = dark;
+              bitIndex++;
+            }
+          }
+
+          upward = !upward;
+        }
+      }
+
+      applyMask(mask) {
+        for (let y = 0; y < this._size; y++) {
+          for (let x = 0; x < this._size; x++) {
+            if (this._isFunction[x][y])
+              continue;
+
+            if (QrCode.maskBit(mask, x, y))
+              this._modules[x][y] = !this._modules[x][y];
+          }
+        }
+      }
+
+      static maskBit(mask, x, y) {
+        switch (mask) {
+          case 0: return ((x + y) & 1) === 0;
+          case 1: return (y & 1) === 0;
+          case 2: return x % 3 === 0;
+          case 3: return (x + y) % 3 === 0;
+          case 4: return ((((Math.floor(y / 2)) + (Math.floor(x / 3))) & 1) === 0);
+          case 5: return (((x * y) % 2) + ((x * y) % 3)) === 0;
+          case 6: return ((((x * y) % 2) + ((x * y) % 3)) & 1) === 0;
+          case 7: return (((((x + y) % 2) + ((x * y) % 3)) & 1) === 0);
+          default: throw new RangeError("mask");
+        }
+      }
+
+      getPenaltyScore() {
+        let score = 0;
+
+        for (let y = 0; y < this._size; y++) {
+          let color = this._modules[0][y];
+          let runLength = 1;
+
+          for (let x = 1; x < this._size; x++) {
+            if (this._modules[x][y] === color) {
+              runLength++;
+            } else {
+              if (runLength >= 5)
+                score += 3 + (runLength - 5);
+
+              color = this._modules[x][y];
+              runLength = 1;
+            }
+          }
+
+          if (runLength >= 5)
+            score += 3 + (runLength - 5);
+        }
+
+        for (let x = 0; x < this._size; x++) {
+          let color = this._modules[x][0];
+          let runLength = 1;
+
+          for (let y = 1; y < this._size; y++) {
+            if (this._modules[x][y] === color) {
+              runLength++;
+            } else {
+              if (runLength >= 5)
+                score += 3 + (runLength - 5);
+
+              color = this._modules[x][y];
+              runLength = 1;
+            }
+          }
+
+          if (runLength >= 5)
+            score += 3 + (runLength - 5);
+        }
+
+        for (let y = 0; y < this._size - 1; y++) {
+          for (let x = 0; x < this._size - 1; x++) {
+            const c = this._modules[x][y];
+            if (c === this._modules[x + 1][y] &&
+                c === this._modules[x][y + 1] &&
+                c === this._modules[x + 1][y + 1]) {
+              score += 3;
+            }
+          }
+        }
+
+        for (let y = 0; y < this._size; y++) {
+          for (let x = 0; x <= this._size - 11; x++) {
+            if (this.matchesFinderLikePatternRow(x, y))
+              score += 40;
+          }
+        }
+
+        for (let x = 0; x < this._size; x++) {
+          for (let y = 0; y <= this._size - 11; y++) {
+            if (this.matchesFinderLikePatternColumn(x, y))
+              score += 40;
+          }
+        }
+
+        let darkCount = 0;
+        for (let y = 0; y < this._size; y++) {
+          for (let x = 0; x < this._size; x++) {
+            if (this._modules[x][y])
+              darkCount++;
+          }
+        }
+
+        const total = this._size * this._size;
+        const k = Math.floor(Math.abs(darkCount * 20 - total * 10) / total);
+        score += k * 10;
+
+        return score;
+      }
+
+      matchesFinderLikePatternRow(x, y) {
+        const p1 = [false, false, false, false, true, false, true, true, true, false, true];
+        const p2 = [true, false, true, true, true, false, true, false, false, false, false];
+
+        let match1 = true;
+        let match2 = true;
+
+        for (let i = 0; i < 11; i++) {
+          const val = this._modules[x + i][y];
+          if (val !== p1[i]) match1 = false;
+          if (val !== p2[i]) match2 = false;
+          if (!match1 && !match2) return false;
+        }
+
+        return match1 || match2;
+      }
+
+      matchesFinderLikePatternColumn(x, y) {
+        const p1 = [false, false, false, false, true, false, true, true, true, false, true];
+        const p2 = [true, false, true, true, true, false, true, false, false, false, false];
+
+        let match1 = true;
+        let match2 = true;
+
+        for (let i = 0; i < 11; i++) {
+          const val = this._modules[x][y + i];
+          if (val !== p1[i]) match1 = false;
+          if (val !== p2[i]) match2 = false;
+          if (!match1 && !match2) return false;
+        }
+
+        return match1 || match2;
+      }
+
+      setFunctionModule(x, y, isDark) {
+        this._modules[x][y] = isDark;
+        this._isFunction[x][y] = true;
+      }
+    }
+
+    // =========================================================================
+    // Reed-Solomon
+    // =========================================================================
+
+    class ReedSolomon {
+      static EXP_TABLE = ReedSolomon.buildExpTable();
+      static LOG_TABLE = ReedSolomon.buildLogTable(ReedSolomon.EXP_TABLE);
+      static DIVISOR_CACHE = new Map();
+
+      static getDivisor(degree) {
+        if (degree <= 0)
+          throw new RangeError("degree");
+
+        if (ReedSolomon.DIVISOR_CACHE.has(degree))
+          return ReedSolomon.DIVISOR_CACHE.get(degree);
+
+        const divisor = ReedSolomon.buildDivisor(degree);
+        ReedSolomon.DIVISOR_CACHE.set(degree, divisor);
+        return divisor;
+      }
+
+      static computeRemainder(data, divisor) {
+        Guard.notNull(data, "data");
+        Guard.notNull(divisor, "divisor");
+
+        const result = new Uint8Array(divisor.length);
+
+        for (let i = 0; i < data.length; i++) {
+          const factor = (data[i] ^ result[0]) & 0xFF;
+
+          for (let j = 0; j < result.length - 1; j++) {
+            result[j] = (result[j + 1] ^ ReedSolomon.multiply(divisor[j], factor)) & 0xFF;
+          }
+
+          result[result.length - 1] = ReedSolomon.multiply(divisor[result.length - 1], factor);
+        }
+
+        return result;
+      }
+
+      static buildDivisor(degree) {
+        let poly = Uint8Array.from([1]);
+
+        for (let i = 0; i < degree; i++) {
+          const root = ReedSolomon.EXP_TABLE[i];
+          const next = new Uint8Array(poly.length + 1);
+
+          for (let j = 0; j < poly.length; j++) {
+            next[j] ^= poly[j];
+            next[j + 1] ^= ReedSolomon.multiply(poly[j], root);
+          }
+
+          poly = next;
+        }
+
+        const result = new Uint8Array(degree);
+        result.set(poly.subarray(1, 1 + degree));
+        return result;
+      }
+
+      static multiply(x, y) {
+        if (x === 0 || y === 0)
+          return 0;
+
+        const log = ReedSolomon.LOG_TABLE[x] + ReedSolomon.LOG_TABLE[y];
+        return ReedSolomon.EXP_TABLE[log];
+      }
+
+      static buildExpTable() {
+        const exp = new Uint8Array(512);
+        let x = 1;
+
+        for (let i = 0; i < 255; i++) {
+          exp[i] = x;
+          x <<= 1;
+          if ((x & 0x100) !== 0)
+            x ^= 0x11D;
+        }
+
+        for (let i = 255; i < exp.length; i++)
+          exp[i] = exp[i - 255];
+
+        return exp;
+      }
+
+      static buildLogTable(expTable) {
+        const log = new Uint8Array(256);
+
+        for (let i = 0; i < 255; i++)
+          log[expTable[i]] = i;
+
+        return log;
+      }
+    }
+
+    // =========================================================================
+    // BMP writer
+    // =========================================================================
+
+    class BmpWriter {
+      static write24BitBmp(modules, moduleSize, scale, border, darkColor, lightColor) {
+        Guard.notNull(modules, "modules");
+        Guard.positive(scale, "scale");
+
+        if (border < 0)
+          throw new RangeError("border");
+
+        const widthModules = moduleSize + border * 2;
+        const heightModules = moduleSize + border * 2;
+
+        const widthPixels = widthModules * scale;
+        const heightPixels = heightModules * scale;
+
+        const rowStride = widthPixels * 3;
+        const paddedRowStride = (rowStride + 3) & ~3;
+
+        const pixelDataSize = paddedRowStride * heightPixels;
+        const fileSize = 14 + 40 + pixelDataSize;
+
+        const bmp = new Uint8Array(fileSize);
+
+        bmp[0] = "B".charCodeAt(0);
+        bmp[1] = "M".charCodeAt(0);
+        BmpWriter.writeInt32LE(bmp, 2, fileSize);
+        BmpWriter.writeInt32LE(bmp, 10, 14 + 40);
+
+        BmpWriter.writeInt32LE(bmp, 14, 40);
+        BmpWriter.writeInt32LE(bmp, 18, widthPixels);
+        BmpWriter.writeInt32LE(bmp, 22, heightPixels);
+        BmpWriter.writeInt16LE(bmp, 26, 1);
+        BmpWriter.writeInt16LE(bmp, 28, 24);
+        BmpWriter.writeInt32LE(bmp, 30, 0);
+        BmpWriter.writeInt32LE(bmp, 34, pixelDataSize);
+        BmpWriter.writeInt32LE(bmp, 38, 2835);
+        BmpWriter.writeInt32LE(bmp, 42, 2835);
+        BmpWriter.writeInt32LE(bmp, 46, 0);
+        BmpWriter.writeInt32LE(bmp, 50, 0);
+
+        const pixelBase = 54;
+
+        for (let py = 0; py < heightPixels; py++) {
+          const logicalY = heightPixels - 1 - py;
+          const moduleY = Math.floor(logicalY / scale) - border;
+
+          const rowOffset = pixelBase + py * paddedRowStride;
+
+          for (let px = 0; px < widthPixels; px++) {
+            const moduleX = Math.floor(px / scale) - border;
+
+            const isDark =
+              moduleX >= 0 &&
+              moduleX < moduleSize &&
+              moduleY >= 0 &&
+              moduleY < moduleSize &&
+              modules[moduleX][moduleY];
+
+            const color = isDark ? darkColor : lightColor;
+            const offset = rowOffset + px * 3;
+            bmp[offset + 0] = color.b;
+            bmp[offset + 1] = color.g;
+            bmp[offset + 2] = color.r;
+          }
+        }
+
+        return bmp;
+      }
+
+      static writeInt16LE(buffer, offset, value) {
+        buffer[offset + 0] = value & 0xFF;
+        buffer[offset + 1] = (value >>> 8) & 0xFF;
+      }
+
+      static writeInt32LE(buffer, offset, value) {
+        buffer[offset + 0] = value & 0xFF;
+        buffer[offset + 1] = (value >>> 8) & 0xFF;
+        buffer[offset + 2] = (value >>> 16) & 0xFF;
+        buffer[offset + 3] = (value >>> 24) & 0xFF;
+      }
+    }
+
+    // =========================================================================
+    // Tables
+    // =========================================================================
+
+    class QrTables {
+      static ECC_CODEWORDS_PER_BLOCK_TABLE = [
+        [
+          -1,
+          7, 10, 15, 20, 26, 18, 20, 24, 30, 18,
+          20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+          28, 28, 30, 30, 26, 28, 30, 30, 30, 30,
+          30, 30, 30, 30, 30, 30, 30, 30, 30, 30
+        ],
+        [
+          -1,
+          10, 16, 26, 18, 24, 16, 18, 22, 22, 26,
+          30, 22, 22, 24, 24, 28, 28, 26, 26, 26,
+          26, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+          28, 28, 28, 28, 28, 28, 28, 28, 28, 28
+        ],
+        [
+          -1,
+          13, 22, 18, 26, 18, 24, 18, 22, 20, 24,
+          28, 26, 24, 20, 30, 24, 28, 28, 26, 30,
+          28, 30, 30, 30, 30, 28, 30, 30, 30, 30,
+          30, 30, 30, 30, 30, 30, 30, 30, 30, 30
+        ],
+        [
+          -1,
+          17, 28, 22, 16, 22, 28, 26, 26, 24, 28,
+          24, 28, 22, 24, 24, 30, 28, 28, 26, 28,
+          30, 24, 30, 30, 30, 30, 30, 30, 30, 30,
+          30, 30, 30, 30, 30, 30, 30, 30, 30, 30
+        ]
+      ];
+
+      static NUM_ERROR_CORRECTION_BLOCKS_TABLE = [
+        [
+          -1,
+          1, 1, 1, 1, 1, 2, 2, 2, 2, 4,
+          4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+          8, 9, 9, 10, 12, 12, 12, 13, 14, 15,
+          16, 17, 18, 19, 19, 20, 21, 22, 24, 25
+        ],
+        [
+          -1,
+          1, 1, 1, 2, 2, 4, 4, 4, 5, 5,
+          5, 8, 9, 9, 10, 10, 11, 13, 14, 16,
+          17, 17, 18, 20, 21, 23, 25, 26, 28, 29,
+          31, 33, 35, 37, 38, 40, 43, 45, 47, 49
+        ],
+        [
+          -1,
+          1, 1, 2, 2, 4, 4, 6, 6, 8, 8,
+          8, 10, 12, 16, 12, 17, 16, 18, 21, 20,
+          23, 23, 25, 27, 29, 34, 34, 35, 38, 40,
+          43, 45, 48, 51, 53, 56, 59, 62, 65, 68
+        ],
+        [
+          -1,
+          1, 1, 2, 4, 4, 4, 5, 6, 8, 8,
+          11, 11, 16, 16, 18, 16, 19, 21, 25, 25,
+          25, 34, 30, 32, 35, 37, 40, 42, 45, 48,
+          51, 54, 57, 60, 63, 66, 70, 74, 77, 81
+        ]
+      ];
+
+      static getNumRawDataModules(version) {
+        Guard.versionRange(version, "version");
+
+        let result = (16 * version + 128) * version + 64;
+
+        if (version >= 2) {
+          const numAlign = Math.floor(version / 7) + 2;
+          result -= (25 * numAlign - 10) * numAlign - 55;
+
+          if (version >= 7)
+            result -= 36;
+        }
+
+        return result;
+      }
+
+      static getNumDataCodewords(version, ecl) {
+        const raw = Math.floor(QrTables.getNumRawDataModules(version) / 8);
+        const ecc = QrTables.getEccCodewordsPerBlock(version, ecl);
+        const blocks = QrTables.getNumErrorCorrectionBlocks(version, ecl);
+        return raw - ecc * blocks;
+      }
+
+      static getNumErrorCorrectionBlocks(version, ecl) {
+        Guard.versionRange(version, "version");
+        return QrTables.NUM_ERROR_CORRECTION_BLOCKS_TABLE[QrTables.eclIndex(ecl)][version];
+      }
+
+      static getEccCodewordsPerBlock(version, ecl) {
+        Guard.versionRange(version, "version");
+        return QrTables.ECC_CODEWORDS_PER_BLOCK_TABLE[QrTables.eclIndex(ecl)][version];
+      }
+
+      static getFormatBitsForEcl(ecl) {
+        switch (ecl) {
+          case QrErrorCorrectionLevel.Low: return 1;
+          case QrErrorCorrectionLevel.Medium: return 0;
+          case QrErrorCorrectionLevel.Quartile: return 3;
+          case QrErrorCorrectionLevel.High: return 2;
+          default: throw new Error("Unsupported ECC level.");
+        }
+      }
+
+      static getAlignmentPatternPositions(version) {
+        Guard.versionRange(version, "version");
+
+        if (version === 1)
+          return [];
+
+        const numAlign = Math.floor(version / 7) + 2;
+        const step = version === 32
+          ? 26
+          : Math.floor((version * 4 + numAlign * 2 + 1) / (numAlign * 2 - 2)) * 2;
+
+        const result = new Array(numAlign);
+        result[0] = 6;
+
+        for (let i = numAlign - 1, pos = version * 4 + 10; i >= 1; i--, pos -= step)
+          result[i] = pos;
+
+        return result;
+      }
+
+      static eclIndex(ecl) {
+        switch (ecl) {
+          case QrErrorCorrectionLevel.Low: return 0;
+          case QrErrorCorrectionLevel.Medium: return 1;
+          case QrErrorCorrectionLevel.Quartile: return 2;
+          case QrErrorCorrectionLevel.High: return 3;
+          default: throw new Error("Unsupported ECC level.");
+        }
+      }
+    }
+
+    // =========================================================================
+    // Bit helpers
+    // =========================================================================
+
+    class BitHelper {
+      static getBitFromBytes(data, bitIndex) {
+        const byteIndex = bitIndex >> 3;
+        const bitInByte = 7 - (bitIndex & 7);
+        return (((data[byteIndex] >> bitInByte) & 1) !== 0);
+      }
+
+      static getBitFromInt(value, bitIndex) {
+        return (((value >> bitIndex) & 1) !== 0);
+      }
+    }
+
+    // =========================================================================
+    // Guard helpers
+    // =========================================================================
+
+    class Guard {
+      static notNull(value, paramName) {
+        if (value == null)
+          throw new TypeError(paramName + " is null.");
+      }
+
+      static notNullOrWhiteSpace(value, paramName) {
+        if (typeof value !== "string" || value.trim().length === 0)
+          throw new Error("Value cannot be null or whitespace: " + paramName);
+      }
+
+      static positive(value, paramName) {
+        if (!(value > 0))
+          throw new RangeError(paramName + " must be > 0.");
+      }
+
+      static versionRange(version, paramName) {
+        if (version < 1 || version > 40)
+          throw new RangeError(paramName + " QR version must be between 1 and 40.");
+      }
+
+      static httpOrHttpsUrl(value, paramName) {
+        let url;
+        try {
+          url = new URL(value);
+        } catch {
+          throw new Error("Value is not a valid absolute URL: " + paramName);
+        }
+
+        if (url.protocol !== "http:" && url.protocol !== "https:")
+          throw new Error("URL must use http or https: " + paramName);
+      }
+    }
+
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    function createBoolMatrix(width, height, initialValue) {
+      const arr = new Array(width);
+      for (let x = 0; x < width; x++) {
+        arr[x] = new Array(height);
+        for (let y = 0; y < height; y++)
+          arr[x][y] = initialValue;
+      }
+      return arr;
+    }
+
+    function bytesToObjectUrl(bytes, mimeType) {
+      const blob = new Blob([bytes], { type: mimeType });
+      return URL.createObjectURL(blob);
+    }
+
+    // =========================================================================
+    // UI
+    // =========================================================================
+
+    const qrImage = document.getElementById("qrImage");
+    const linkInput = document.getElementById("linkInput");
+    const statusEl = document.getElementById("status");
+
+    let currentObjectUrl = null;
+
+    function setImageBytes(bytes) {
+      if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+      }
+
+      currentObjectUrl = bytesToObjectUrl(bytes, "image/bmp");
+      qrImage.src = currentObjectUrl;
+    }
+
+    function clearImage() {
+      if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+      }
+      qrImage.removeAttribute("src");
+    }
+
+    function updateQr() {
+      const value = linkInput.value.trim();
+
+      if (value.length === 0) {
+        clearImage();
+        statusEl.textContent = "";
+        return;
+      }
+
+      try {
+        const result = QrBitmapGenerator.createUrl(value, null);
+        setImageBytes(result.bmpBytes);
+        statusEl.textContent = "Version " + result.version + " • Size " + result.size + " • Mask " + result.mask;
+      } catch (err) {
+        clearImage();
+        statusEl.textContent = err && err.message ? err.message : "Invalid input.";
+      }
+    }
+
+    linkInput.addEventListener("input", updateQr);
+
+    linkInput.value = "https://example.com";
+    updateQr();
+  </script>
+</body>
+</html>
