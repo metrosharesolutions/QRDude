@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./qrdude.png" alt="QR Dude" width="300">
+</p>
+
 # QRDude
 
 Hey, you need a QR, dude?
